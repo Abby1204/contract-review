@@ -5,7 +5,7 @@ const StoreContext = createContext(null)
 
 function loadState() {
   try {
-    const saved = localStorage.getItem('contract-review-v1')
+    const saved = localStorage.getItem('contract-review-v2')
     if (saved) return JSON.parse(saved)
   } catch {}
   return { ...SEED_DATA, currentUserEmail: null }
@@ -13,7 +13,7 @@ function loadState() {
 
 function saveState(state) {
   try {
-    localStorage.setItem('contract-review-v1', JSON.stringify(state))
+    localStorage.setItem('contract-review-v2', JSON.stringify(state))
   } catch {}
 }
 
@@ -57,10 +57,23 @@ export function StoreProvider({ children }) {
   const getVisibleContracts = (userEmail) =>
     state.contracts.filter(c => canSeeContract(c, userEmail))
 
+  // Progress: count participants whose comment has EVER been submitted (submitted_once)
   const getContractProgress = (contractId) => {
     const active = state.participants.filter(p => p.contract_id === contractId && p.status === 'active')
-    const submitted = state.comments.filter(c => c.contract_id === contractId && c.is_active && c.status === 'submitted')
-    return { total: active.length, submitted: submitted.length, allDone: active.length > 0 && submitted.length >= active.length }
+    // submitted_once = submitted_at is set (even if later re-edited, still counts)
+    const submittedOnce = state.comments.filter(
+      c => c.contract_id === contractId && c.is_active && c.submitted_at !== null
+    )
+    return {
+      total: active.length,
+      submitted: submittedOnce.length,
+      allDone: active.length > 0 && submittedOnce.length >= active.length,
+    }
+  }
+
+  // Can a participant edit their comment?
+  const canEditComment = (contract) => {
+    return !['mgr_pending', 'exec_pending', 'approved', 'archived'].includes(contract.status)
   }
 
   const getTodos = (userEmail) => {
@@ -74,7 +87,8 @@ export function StoreProvider({ children }) {
         ? state.comments.find(c => c.contract_id === contract.id && c.participant_id === myParticipant.id && c.is_active)
         : null
 
-      if (myParticipant && ['in_review', 'returned'].includes(contract.status) && myComment?.status === 'draft') {
+      // Participant: hasn't submitted yet (submitted_at === null)
+      if (myParticipant && ['in_review', 'returned', 'new'].includes(contract.status) && myComment?.submitted_at === null) {
         todos.push({ contract, reason: '尚未提交意見', type: 'comment' })
         continue
       }
@@ -87,12 +101,12 @@ export function StoreProvider({ children }) {
         continue
       }
       const isCoordinator = contract.opened_by === userEmail || isCentralCoordinator(userEmail)
-      if (isCoordinator && contract.status === 'in_review') {
+      if (isCoordinator && ['in_review', 'new'].includes(contract.status)) {
         const { allDone } = getContractProgress(contract.id)
         if (allDone) todos.push({ contract, reason: '全員已提交，可送審', type: 'submit' })
       }
       if (isCentralCoordinator(userEmail) && contract.status === 'approved') {
-        todos.push({ contract, reason: '可觸發歸檔', type: 'archive' })
+        todos.push({ contract, reason: '可觸發歸檔 / 送 Top Manager', type: 'archive' })
       }
       if (isCentralCoordinator(userEmail) && contract.status === 'exec_pending') {
         todos.push({ contract, reason: 'Manual Remind', type: 'remind' })
@@ -105,16 +119,20 @@ export function StoreProvider({ children }) {
   const login = (email) => update({ currentUserEmail: email })
   const logout = () => update({ currentUserEmail: null })
 
-  const createContract = ({ title, category_id, manager_email, exec_email, approval_layers, file_path }) => {
+  // Step 1: create contract (no manager/layers yet)
+  const createContract = ({ title, vendor_name, contract_date, category_id, file_path, ai_summary }) => {
     const id = state.nextIds.contracts
     const contract = {
       id, uuid: `c${String(id).padStart(3, '0')}-${Date.now()}`,
-      title, category_id: parseInt(category_id), status: 'new',
-      approval_layers: parseInt(approval_layers),
+      title, vendor_name, contract_date,
+      category_id: parseInt(category_id),
+      status: 'new',
+      approval_layers: null,
       opened_by: state.currentUserEmail,
-      manager_email,
-      exec_email: parseInt(approval_layers) === 2 ? exec_email : null,
-      file_path: file_path || 'contract.pdf',
+      manager_email: null, exec_email: null,
+      ai_summary: ai_summary || null,
+      ai_summary_edited: false,
+      file_path: file_path || null,
       created_at: new Date().toISOString(), submitted_at: null, archived_at: null,
     }
     update(s => ({
@@ -123,6 +141,17 @@ export function StoreProvider({ children }) {
       nextIds: { ...s.nextIds, contracts: s.nextIds.contracts + 1 },
     }))
     return id
+  }
+
+  const saveAiSummary = (contractId, summary, isEdited = true) => {
+    update(s => ({
+      ...s,
+      contracts: s.contracts.map(c =>
+        c.id === contractId
+          ? { ...c, ai_summary: summary, ai_summary_edited: isEdited }
+          : c
+      ),
+    }))
   }
 
   const inviteParticipant = (contractId, email, roleLabel) => {
@@ -158,6 +187,7 @@ export function StoreProvider({ children }) {
     }))
   }
 
+  // Update comment content — allowed as long as contract not in mgr_pending+
   const updateComment = (commentId, content) => {
     update(s => ({
       ...s,
@@ -167,22 +197,38 @@ export function StoreProvider({ children }) {
     }))
   }
 
+  // Submit comment — sets submitted_at (progress counter, only advances)
   const submitComment = (commentId) => {
     update(s => ({
       ...s,
       comments: s.comments.map(c =>
         c.id === commentId
-          ? { ...c, status: 'submitted', submitted_at: new Date().toISOString(), updated_at: new Date().toISOString() }
+          ? {
+              ...c,
+              status: 'submitted',
+              submitted_at: c.submitted_at || new Date().toISOString(), // preserve first submission time
+              updated_at: new Date().toISOString(),
+            }
           : c
       ),
     }))
   }
 
-  const submitToManager = (contractId) => {
+  // Submit to manager — manager_email and approval_layers chosen NOW
+  const submitToManager = (contractId, { manager_email, approval_layers, exec_email }) => {
     update(s => ({
       ...s,
       contracts: s.contracts.map(c =>
-        c.id === contractId ? { ...c, status: 'mgr_pending', submitted_at: new Date().toISOString() } : c
+        c.id === contractId
+          ? {
+              ...c,
+              status: 'mgr_pending',
+              manager_email,
+              approval_layers: parseInt(approval_layers),
+              exec_email: parseInt(approval_layers) === 2 ? exec_email : c.exec_email,
+              submitted_at: new Date().toISOString(),
+            }
+          : c
       ),
     }))
   }
@@ -191,7 +237,7 @@ export function StoreProvider({ children }) {
     update(s => {
       const contract = s.contracts.find(c => c.id === contractId)
       let newStatus = 'approved'
-      if (contract.status === 'mgr_pending' && contract.approval_layers === 2) {
+      if (contract.status === 'mgr_pending' && contract.approval_layers === 2 && contract.exec_email) {
         newStatus = 'exec_pending'
       }
       return {
@@ -207,19 +253,39 @@ export function StoreProvider({ children }) {
       contracts: s.contracts.map(c =>
         c.id === contractId ? { ...c, status: 'returned' } : c
       ),
+      // Reset comment status to draft so they know to re-check, but submitted_at preserved (progress intact)
       comments: s.comments.map(c =>
-        c.contract_id === contractId && c.is_active
-          ? { ...c, status: 'draft', submitted_at: null }
+        c.contract_id === contractId && c.is_active ? { ...c, status: 'draft' } : c
+      ),
+    }))
+  }
+
+  const resubmitAfterReturn = (contractId, { manager_email, approval_layers, exec_email }) => {
+    update(s => ({
+      ...s,
+      contracts: s.contracts.map(c =>
+        c.id === contractId
+          ? {
+              ...c,
+              status: 'mgr_pending',
+              manager_email,
+              approval_layers: parseInt(approval_layers),
+              exec_email: parseInt(approval_layers) === 2 ? exec_email : null,
+              submitted_at: new Date().toISOString(),
+            }
           : c
       ),
     }))
   }
 
-  const resubmitAfterReturn = (contractId) => {
+  // CC escalates approved contract to Top Manager (v1.4: flexible, not limited by approval_layers)
+  const escalateToExec = (contractId, exec_email) => {
     update(s => ({
       ...s,
       contracts: s.contracts.map(c =>
-        c.id === contractId ? { ...c, status: 'in_review' } : c
+        c.id === contractId
+          ? { ...c, status: 'exec_pending', exec_email, approval_layers: 2 }
+          : c
       ),
     }))
   }
@@ -250,12 +316,14 @@ export function StoreProvider({ children }) {
     getCategoryById,
     getUserByEmail,
     canSeeContract,
+    canEditComment,
     getVisibleContracts,
     getContractProgress,
     getTodos,
     login,
     logout,
     createContract,
+    saveAiSummary,
     inviteParticipant,
     removeParticipant,
     updateComment,
@@ -264,6 +332,7 @@ export function StoreProvider({ children }) {
     approveContract,
     returnContract,
     resubmitAfterReturn,
+    escalateToExec,
     archiveContract,
     resetData,
     USERS,
